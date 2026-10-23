@@ -1,81 +1,49 @@
-# DUST
+# DUST memory optimizations
 
-This is a minimal implementation of our research: <https://qlabs.sh/research/dust>
+Peak-memory reductions for DUST (`dust.py`) and the noise record (`dust_noise.py`). 
+Results in [NOTES.md](NOTES.md).
 
-Train a transformer using forward evaluations and SGD, without backpropagation.
-This minimal implementation preserves the paper's estimator and tuned defaults
-while omitting execution optimizations used in the full experiments.
+## Layout
 
-[`model.py`](model.py) contains the model, and [`dust.py`](dust.py) the algorithm and training loop. A simple
-[backpropagation SGD baseline](baselines/backprop.py) uses the same model and data.
+| Path | Contents |
+|---|---|
+| `model.py`, `dust.py`, `dust_noise.py` | The model and the two original algorithms, unchanged |
+| `dust_optimized.py` | DUST with all six optimizations (standalone) |
+| `dust_noise_optimized.py` | dust_noise with all seven optimizations; stage 7, built on `stages/noise/stage6.py` |
+| `stages/dust/stageN.py` | DUST with optimizations 1 to N |
+| `stages/noise/stageN.py` | dust_noise with optimizations 1 to N |
+| `benchmark.py` | Times steps and records peak memory for any method, stage or model size |
+| `check_noise.py` | Compares a noise stage's gradients with dust_noise's on one batch |
+| `memory_report.py` | Summarizes a CUDA memory snapshot by allocating line and method |
+| `modal_app.py` | Runs the above on Modal H100s |
 
-## Installation
-
-Requires Linux, Python 3.10+, and an NVIDIA GPU with bfloat16 support.
-The following installs PyTorch with CUDA 12.8; use a compatible NVIDIA driver.
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cu128
-python -m pip install -r requirements.txt
-```
-
-## Data
-
-Prepare the 1M and 10M training sets:
+## Running
 
 ```bash
-python prepare_data.py
+python benchmark.py --method optimized --population 4096           # dust, stage1..5, optimized
+python benchmark.py --method noise-cut-stage3                         # noise-{boost,cut}[-stageN|-opt]
+python benchmark.py --method noise-cut-opt --n-layer 16 --n-embd 1024 # scaled model
+python benchmark.py --method dust --population 4096 --memory-only     # one draw chunk per site: same peak, faster
+python benchmark.py --method noise-cut --memory-snapshot --output runs/bench/x.json
+python memory_report.py runs/bench/x.pickle
+python check_noise.py --module stages.noise.stage2
 ```
 
-This streams FineWeb from Hugging Face and saves `data/train_1M.pt`,
-`data/train_10M.pt`, and shared `data/val.pt` and `data/test.pt` files.
-Use `--tokens 1M` or `--tokens 10M` to prepare only one training budget.
-Each held-out split contains 544 sequences of 2,048 prediction tokens.
-
-The fixed BPE-4096 tokenizer is included; retraining is optional.
-Its training recipe and script are in [`tokenizer/`](tokenizer/README.md).
-
-## DUST
-
-Train with the default population of **16,384** on eight GPUs:
+On Modal (one H100 per run; results are copied to `runs/bench/`, snapshots stay in the `dust-runs` volume):
 
 ```bash
-torchrun --standalone --nproc_per_node=8 dust.py --tokens 1M --output runs/1m
-torchrun --standalone --nproc_per_node=8 dust.py --tokens 10M --output runs/10m
+modal run modal_app.py::prepare --tokens 1M                                   # data into dust-data volume
+modal run modal_app.py::benchmark --method optimized --population 4096
+modal run modal_app.py::benchmark --method noise-cut-stage3 --steps 3 --warmup 1
+modal run modal_app.py::benchmark --method noise-cut-opt --n-layer 16 --n-embd 1024
+modal run modal_app.py::benchmark --method dust --population 4096 --memory-only
+modal run modal_app.py::benchmark --method noise-cut --eager
+modal run modal_app.py::benchmark --method noise-cut --memory-snapshot --name snap-noise-cut
+modal volume get dust-runs bench/snap-noise-cut.pickle runs/bench/snap-noise-cut.pickle
+modal run modal_app.py::check_noise --module stages.noise.stage2 --chain-tokens 512
+modal run modal_app.py::dust --tokens 1M --population 256 --optimized         # training
+modal run modal_app.py::noise --tokens 1M --gpus 8
 ```
-
-For a smaller, single-GPU run:
-
-```bash
-python dust.py --tokens 1M --population 256 --output runs/1m-p256
-```
-
-Supported populations are **256, 1024, 4096, and 16384**, using respectively
-**1, 1, 4, and 8 GPUs** in the paper configurations. Each selects its tuned
-per-layer draw allocation, credit decay and optimizer settings. Population counts direct-loss
-draws across all GPUs; head and local attention draws are additional. Every GPU
-processes the same batch and contributes different perturbations.
-
-Both token budgets use an 8-layer, 512-wide transformer, sequence length 2,048,
-and batch size 8. Add `--steps 2` for a short check using the selected dataset.
-
-## Backpropagation baseline
-
-Run SGD backpropagation on one GPU:
-
-```bash
-python baselines/backprop.py --tokens 1M --output runs/bp-1m
-python baselines/backprop.py --tokens 10M --output runs/bp-10m
-```
-
-## Outputs
-
-Each run saves its configuration, metrics, a validation-selected `best.pt`, and
-`result.json` containing the selected checkpoint's test loss. Use a new output
-directory for each run. Data, checkpoints, and logs are stored locally.
 
 ## License
 
